@@ -557,9 +557,6 @@ class PdfCollageApp(ttk.Frame):
         x0, y0, x1, y1 = self._world_bounds()
         width  = (x1 - x0) + margin * 2
         height = (y1 - y0) + margin * 2
-        if width <= 1 or height <= 1:
-            messagebox.showerror("範囲なし", "ページサイズが不正です。")
-            return
 
         save = filedialog.asksaveasfilename(
             title="保存先", defaultextension=".pdf",
@@ -572,20 +569,21 @@ class PdfCollageApp(ttk.Frame):
             out = fitz.open()
             page = out.new_page(width=width, height=height)
 
-            # items の並び順 = 前後関係（後ろほど前面）
             for it in self.state.items:
-                # GUI の左上（上原点）→ PDF の配置矩形（下原点）に変換
-                tx = (it.x - x0) + margin              # 左上X（GUIそのまま）
-                ty = (it.y - y0) + margin              # 左上Y（GUIそのまま）
+                # GUI（上原点）の左上位置
+                x_gui = (it.x - x0) + margin
+                y_gui_top = (it.y - y0) + margin
 
-                dw = it.w * it.scale                   # 目的の幅
-                dh = it.h * it.scale                   # 目的の高さ
+                # 配置サイズ（pt）
+                dw = it.w * it.scale
+                dh = it.h * it.scale
 
-                # ★ Y 反転：GUIの「上から ty」→ PDFでは「下から (height - ty)」
-                y1_pdf = height - ty                   # PDF矩形の上側
-                y0_pdf = y1_pdf - dh                   # PDF矩形の下側
-                x0_pdf = tx
-                x1_pdf = tx + dw
+                # GUI（上原点）からPDF（下原点）への座標変換
+                # GUIでの位置をそのままPDFの位置に対応させる
+                y0_pdf = y_gui_top         # 矩形の上
+                y1_pdf = y_gui_top + dh    # 矩形の下
+                x0_pdf = x_gui             # 矩形の左
+                x1_pdf = x_gui + dw        # 矩形の右
 
                 dest = fitz.Rect(x0_pdf, y0_pdf, x1_pdf, y1_pdf)
 
@@ -598,7 +596,6 @@ class PdfCollageApp(ttk.Frame):
 
         except Exception as e:
             messagebox.showerror("保存エラー", f"保存に失敗しました:\n{e}")
-
 
 
 # ------------------------- main -------------------------
