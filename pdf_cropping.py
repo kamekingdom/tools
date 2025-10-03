@@ -1,26 +1,16 @@
-# Author: kamekingdom (2025-09-29)
+# pdf_cropping_gui.py
 """
 PDF Trimming GUI (Tkinter + PyMuPDF)
+- Canvas上の見た目どおりにPDFをクロップ
+- 回転(/Rotate)・zoom・表示縮小(display_scale)は逆行列で一括補正
+- 重要: get_pixmap のピクセルは「上原点(top-left)」→ Y反転しない！
 
-機能概要:
-- PDF をファイルダイアログから選択
-- ページ画像を Canvas に表示
-- マウスドラッグでトリミング領域(矩形)を指定 (ラバーバンド表示)
-- 前/次ページ移動、選択のリセット
-- 現在ページのみ / 全ページに同一比率で適用を選択
-- 別名保存でクロップ済み PDF を出力
-
-依存関係:
+依存:
   pip install pymupdf pillow
-  (PyMuPDF は "fitz" 名で import)
-
-注意:
-- PyMuPDF の座標は PDF 下原点(左下が (0,0))。Canvas 上は上原点。変換ロジックで吸収しています。
-- ページごとの寸法が異なる場合でも、"全ページに適用" は比率ベースで適用します。
 """
+
 from __future__ import annotations
 
-import io
 import sys
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -41,22 +31,23 @@ except Exception as e:  # pragma: no cover
 
 # ----------------------------- 型定義 -----------------------------
 RectPts = Tuple[float, float, float, float]  # (x0,y0,x1,y1) in PDF points (左下原点)
-RectFrac = Tuple[float, float, float, float]  # (x0/W, y0/H, x1/W, y1/H) 比率
 
 
 @dataclass
 class PageView:
     page_index: int
-    zoom: float = 2.0  # レンダリング倍率 (2.0 ≒ 144dpi)
-    display_scale: float = 1.0  # 画像のさらに縮小倍率
-    pix_width: int = 1
-    pix_height: int = 1
+    zoom: float = 2.0                  # レンダリング倍率 (2.0 ≒ 144dpi)
+    display_scale: float = 1.0         # さらに縮小して Canvas に表示
+    pix_width: int = 1                 # get_pixmap 後のピクセル幅（prerotate・zoom 反映後）
+    pix_height: int = 1                # 同ピクセル高さ
     img_tk: Optional[ImageTk.PhotoImage] = None
+    mat: Optional[fitz.Matrix] = None      # ページ → デバイス行列（zoom + rotation）
+    inv_mat: Optional[fitz.Matrix] = None  # 上記の逆行列（デバイス → ページ）
 
 
 @dataclass
 class Selection:
-    # Canvas 上座標 (上原点, ピクセル単位)
+    # Canvas 上座標 (上原点, ピクセル)
     x0: Optional[int] = None
     y0: Optional[int] = None
     x1: Optional[int] = None
@@ -66,8 +57,6 @@ class Selection:
         if None in (self.x0, self.y0, self.x1, self.y1):
             return None
         x0, y0, x1, y1 = self.x0, self.y0, self.x1, self.y1
-        if x0 is None or y0 is None or x1 is None or y1 is None:
-            return None
         return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
 
     def clear(self) -> None:
@@ -81,110 +70,69 @@ class AppState:
     page_view: PageView = field(default_factory=lambda: PageView(page_index=0))
     selection: Selection = field(default_factory=Selection)
     selection_rect_id: Optional[int] = None  # Canvas item id
-    apply_all: tk.BooleanVar | None = None
+    apply_all: Optional[tk.BooleanVar] = None
 
 
 # ----------------------------- ユーティリティ -----------------------------
-# 画像の描画原点（Canvas 内のオフセット）
-IMG_OFFSET_X: int = 20
+IMG_OFFSET_X: int = 20  # Canvas 内の画像の左上オフセット
 IMG_OFFSET_Y: int = 20
 
 
-def display_to_points(
-    x_disp: float,
-    y_disp: float,
-    page_rect: fitz.Rect,
-    zoom: float,
-    display_scale: float,
-) -> Tuple[float, float]:
-    """Canvas(上原点, px) → PDF points(下原点) に変換。
+def _apply_matrix_to_point(mat: "fitz.Matrix", x: float, y: float) -> "fitz.Point":
+    """Matrix を点に適用（バージョン差吸収のため手計算）。"""
+    return fitz.Point(
+        mat.a * x + mat.c * y + mat.e,
+        mat.b * x + mat.d * y + mat.f,
+    )
 
-    変換は以下の考え方:
-      pix_width  = page_rect.width  * zoom
-      disp_width = pix_width * display_scale
-      よって 1 disp_px = 1 / (zoom * display_scale) [points]
 
-    また Y については PDF 下原点に合わせるため、
-      y_top_pts = y_disp / (zoom * display_scale)
-      y_pts = page_rect.height - y_top_pts
+def selection_canvas_to_page_rect(sel: Selection, pv: PageView, page: "fitz.Page") -> Optional[RectPts]:
     """
-    scale = 1.0 / (zoom * display_scale)
-    x_pts_top = x_disp * scale
-    y_top_pts = y_disp * scale
-    x_pts = x_pts_top
-    y_pts = float(page_rect.height) - y_top_pts
-    return x_pts, y_pts
-
-
-def selection_disp_to_points(
-    sel: Selection, page_rect: fitz.Rect, zoom: float, display_scale: float
-) -> Optional[RectPts]:
-    """Canvas 選択(上原点, px) → PDF points(下原点) への変換。
-
-    - Canvas では画像は (IMG_OFFSET_X, IMG_OFFSET_Y) に配置されているため、
-      選択座標からこのオフセットを減算する。
-    - さらに、表示画像サイズ (disp_w, disp_h) を超える分をクリップして
-      MediaBox 外に出ないようにする。
+    Canvas 矩形(上原点, px) → ページ座標(points, 下原点, 未回転)。
+    注意: get_pixmap のピクセル座標は「上原点」。→ Y反転は不要！
+    変換手順:
+      Canvas(px, top-left)
+        └─(オフセット除去)→ 表示画像 px (top-left)
+        └─(/display_scale)→ デバイス px (top-left)   # get_pixmap のピクセル
+        └─(inv_mat)──────→ ページ座標(points)
     """
     n = sel.normalized()
-    if n is None:
+    if n is None or pv.inv_mat is None:
         return None
     x0, y0, x1, y1 = n
 
-    # オフセット補正
-    x0 -= IMG_OFFSET_X
-    y0 -= IMG_OFFSET_Y
-    x1 -= IMG_OFFSET_X
-    y1 -= IMG_OFFSET_Y
+    # 画像のキャンバス内オフセットを除去
+    x0 -= IMG_OFFSET_X; y0 -= IMG_OFFSET_Y
+    x1 -= IMG_OFFSET_X; y1 -= IMG_OFFSET_Y
 
-    # 表示画像サイズ（px）
-    disp_w = float(page_rect.width) * zoom * display_scale
-    disp_h = float(page_rect.height) * zoom * display_scale
+    # 表示画像サイズ（px, top-left）
+    disp_w = pv.pix_width * pv.display_scale
+    disp_h = pv.pix_height * pv.display_scale
 
-    # クリッピング（[0, disp_w/h] に制限）
-    def clamp(v: float, lo: float, hi: float) -> float:
-        return max(lo, min(hi, v))
-
-    x0 = clamp(x0, 0.0, disp_w)
-    x1 = clamp(x1, 0.0, disp_w)
-    y0 = clamp(y0, 0.0, disp_h)
-    y1 = clamp(y1, 0.0, disp_h)
-
-    # 無効領域は破棄
+    # 表示外をクリップ
+    def clamp(v, lo, hi): return max(lo, min(hi, v))
+    x0, x1 = sorted((clamp(x0, 0.0, disp_w), clamp(x1, 0.0, disp_w)))
+    y0, y1 = sorted((clamp(y0, 0.0, disp_h), clamp(y1, 0.0, disp_h)))
     if abs(x1 - x0) < 1e-6 or abs(y1 - y0) < 1e-6:
         return None
 
-    # px → points 変換
-    scale = 1.0 / (zoom * display_scale)
-    x0_top = x0 * scale
-    x1_top = x1 * scale
-    y0_top = y0 * scale
-    y1_top = y1 * scale
+    # 表示 px → デバイス px（プレビュー縮小を外す）※上原点のまま
+    x0_dev = x0 / pv.display_scale
+    y0_dev = y0 / pv.display_scale
+    x1_dev = x1 / pv.display_scale
+    y1_dev = y1 / pv.display_scale
 
-    # 上原点 → 下原点
-    H = float(page_rect.height)
-    y0_pts = H - y0_top
-    y1_pts = H - y1_top
+    # 逆行列で「デバイス → ページ」へ（Y反転なし！）
+    p0 = _apply_matrix_to_point(pv.inv_mat, x0_dev, y0_dev)
+    p1 = _apply_matrix_to_point(pv.inv_mat, x1_dev, y1_dev)
 
-    x0p, x1p = x0_top, x1_top
-    y0p, y1p = y0_pts, y1_pts
-
-    # 正規化
-    return (min(x0p, x1p), min(y0p, y1p), max(x0p, x1p), max(y0p, y1p))
-
-
-def rect_points_to_frac(rect_pts: RectPts, page_rect: fitz.Rect) -> RectFrac:
-    W = float(page_rect.width)
-    H = float(page_rect.height)
-    x0, y0, x1, y1 = rect_pts
-    return (x0 / W, y0 / H, x1 / W, y1 / H)
-
-
-def rect_frac_to_points(frac: RectFrac, page_rect: fitz.Rect) -> RectPts:
-    W = float(page_rect.width)
-    H = float(page_rect.height)
-    fx0, fy0, fx1, fy1 = frac
-    return (fx0 * W, fy0 * H, fx1 * W, fy1 * H)
+    # 正規化 & page.rect でクリップ（基準は常に page.rect に統一）
+    x0p, x1p = sorted((p0.x, p1.x))
+    y0p, y1p = sorted((p0.y, p1.y))
+    rect = fitz.Rect(x0p, y0p, x1p, y1p) & page.rect
+    if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+        return None
+    return (rect.x0, rect.y0, rect.x1, rect.y1)
 
 
 # ----------------------------- GUI 本体 -----------------------------
@@ -203,7 +151,6 @@ class PdfCropperApp(ttk.Frame):
 
     # ------------------------- UI 構築 -------------------------
     def _build_widgets(self) -> None:
-        # Top toolbar
         toolbar = ttk.Frame(self)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
@@ -217,15 +164,11 @@ class PdfCropperApp(ttk.Frame):
         for w in (self.btn_open, self.btn_prev, self.btn_next, self.btn_reset, self.chk_apply_all, self.btn_save):
             w.pack(side=tk.LEFT, padx=6, pady=6)
 
-        # Status bar
         self.status = ttk.Label(self, text="PDF を開いてください", anchor=tk.W)
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Canvas (画像表示)
         self.canvas = tk.Canvas(self, bg="#222222", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # 画像オブジェクト保持用
         self._canvas_img_id: Optional[int] = None
 
     def _bind_canvas_events(self) -> None:
@@ -263,16 +206,12 @@ class PdfCropperApp(ttk.Frame):
         self._draw_selection()
 
     def on_canvas_resize(self, e: tk.Event) -> None:
-        # ウィンドウサイズ変更時に現在ページを再描画 (表示倍率のみ再計算)
         if self.state.doc:
             self.render_current_page()
 
     # ------------------------- PDF 操作 -------------------------
     def open_pdf(self) -> None:
-        path = filedialog.askopenfilename(
-            title="PDF を選択",
-            filetypes=[("PDF files", "*.pdf")]
-        )
+        path = filedialog.askopenfilename(title="PDF を選択", filetypes=[("PDF files", "*.pdf")])
         if not path:
             return
         try:
@@ -318,42 +257,52 @@ class PdfCropperApp(ttk.Frame):
             return
         pv = self.state.page_view
         page = self.state.doc.load_page(pv.page_index)
-        rect_pts = selection_disp_to_points(self.state.selection, page.rect, pv.zoom, pv.display_scale)
+
+        rect_pts = selection_canvas_to_page_rect(self.state.selection, pv, page)
         if rect_pts is None:
             messagebox.showwarning("選択なし", "トリミングする領域をドラッグで選択してください。")
             return
 
-        # 比率で保持 (全ページ適用用)
-        frac = rect_points_to_frac(rect_pts, page.rect)
+        # page.rect 基準でクロップ
+        base_rect = page.rect
+        crop = (fitz.Rect(*rect_pts) & base_rect)
+        if crop.is_empty or crop.width <= 0 or crop.height <= 0:
+            messagebox.showwarning("選択なし", "選択領域がページ内にありません。再度選択してください。")
+            return
+
+        # 全ページ適用のため比率（page.rect 基準）
+        fx0 = (crop.x0 - base_rect.x0) / float(base_rect.width)
+        fy0 = (crop.y0 - base_rect.y0) / float(base_rect.height)
+        fx1 = (crop.x1 - base_rect.x0) / float(base_rect.width)
+        fy1 = (crop.y1 - base_rect.y0) / float(base_rect.height)
 
         save_path = filedialog.asksaveasfilename(
-            title="保存先を選択",
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-            initialfile="cropped.pdf",
+            title="保存先を選択", defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")], initialfile="cropped.pdf",
         )
         if not save_path:
             return
 
         try:
-            # 元ドキュメントをコピーして安全に更新
             out = fitz.open(self.state.path)
             if self.state.apply_all and self.state.apply_all.get():
                 for i in range(out.page_count):
                     p = out.load_page(i)
-                    pts = rect_frac_to_points(frac, p.rect)
-                    crop = fitz.Rect(*pts) & p.rect
-                    if crop.is_empty or crop.width <= 0 or crop.height <= 0:
-                        continue
-                    p.set_cropbox(crop)
+                    b = p.rect  # 全ページ page.rect 基準
+                    rect = fitz.Rect(
+                        b.x0 + fx0 * b.width,  b.y0 + fy0 * b.height,
+                        b.x0 + fx1 * b.width,  b.y0 + fy1 * b.height,
+                    ) & b
+                    if not rect.is_empty:
+                        p.set_cropbox(rect)
+                        # 必要なら MediaBox も合わせるとビューア差異がさらに減る:
+                        # p.set_mediabox(rect)
             else:
                 p = out.load_page(pv.page_index)
-                crop = (fitz.Rect(*rect_pts) & p.rect)
-                if crop.is_empty or crop.width <= 0 or crop.height <= 0:
-                    messagebox.showwarning("選択なし", "選択領域がページ内にありません。再度選択してください。")
-                    out.close()
-                    return
-                p.set_cropbox(crop)
+                b = p.rect
+                rect = (crop & b)
+                p.set_cropbox(rect)
+                # p.set_mediabox(rect)  # 必要なら有効化
 
             out.save(save_path)
             out.close()
@@ -367,26 +316,28 @@ class PdfCropperApp(ttk.Frame):
         pv = self.state.page_view
         page = self.state.doc.load_page(pv.page_index)
 
-        # レンダリング解像度
-        zoom = pv.zoom
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # ページ→デバイス行列（回転をプレビューに反映）
+        mat = fitz.Matrix(pv.zoom, pv.zoom).prerotate(page.rotation)
+        pv.mat = mat
+        inv = fitz.Matrix(mat); inv.invert()
+        pv.inv_mat = inv
 
+        # ビットマップ化（page.rect 基準）
+        pix = page.get_pixmap(matrix=mat, alpha=False)
         pv.pix_width, pv.pix_height = pix.width, pix.height
 
-        # Canvas 幅に合わせて表示縮小(横基準)。余裕を持って 40px 余白
+        # Canvas サイズに合わせて表示縮小（拡大はしない）
         c_w = max(self.canvas.winfo_width() - 40, 200)
         c_h = max(self.canvas.winfo_height() - 40, 200)
-        # 横幅基準で縮小。ただし縦がはみ出る場合は縦基準に切替
         scale_w = c_w / pv.pix_width
         scale_h = c_h / pv.pix_height
-        display_scale = min(scale_w, scale_h, 1.0)  # 1.0 を超えて拡大しない
-        pv.display_scale = float(display_scale)
+        pv.display_scale = float(min(scale_w, scale_h, 1.0))
 
-        # PIL 画像へ
+        # PIL 画像へ変換／縮小
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        if display_scale < 1.0:
-            new_size = (max(1, int(pix.width * display_scale)), max(1, int(pix.height * display_scale)))
+        if pv.display_scale < 1.0:
+            new_size = (max(1, int(pix.width * pv.display_scale)),
+                        max(1, int(pix.height * pv.display_scale)))
             img = img.resize(new_size, Image.LANCZOS)
         pv.img_tk = ImageTk.PhotoImage(img)
 
@@ -395,36 +346,35 @@ class PdfCropperApp(ttk.Frame):
         self._canvas_img_id = self.canvas.create_image(
             IMG_OFFSET_X, IMG_OFFSET_Y, image=pv.img_tk, anchor=tk.NW
         )
-        self.canvas.config(scrollregion=(0, 0, img.width + IMG_OFFSET_X*2, img.height + IMG_OFFSET_Y*2))
+        self.canvas.config(scrollregion=(0, 0, img.width + IMG_OFFSET_X * 2, img.height + IMG_OFFSET_Y * 2))
 
-        # 選択枠の再描画
+        # 既存の選択枠を再描画
         if self.state.selection_rect_id is not None:
+            self.canvas.delete(self.state.selection_rect_id)
             self.state.selection_rect_id = None
         if self.state.selection.normalized() is not None:
             self._draw_selection()
 
-        # ボタン状態
+        # ボタン状態・ステータス
         self.btn_prev.config(state=(tk.NORMAL if pv.page_index > 0 else tk.DISABLED))
         self.btn_next.config(state=(tk.NORMAL if pv.page_index < self.state.doc.page_count - 1 else tk.DISABLED))
         self.btn_reset.config(state=tk.NORMAL)
         self.btn_save.config(state=tk.NORMAL)
 
-        self.status.config(text=f"ページ {pv.page_index + 1} / {self.state.doc.page_count} | 表示倍率: {zoom:.1f}x × {display_scale:.2f}")
+        self.status.config(
+            text=f"ページ {pv.page_index + 1} / {self.state.doc.page_count} | "
+                 f"zoom: {pv.zoom:.1f}x | disp: {pv.display_scale:.2f}"
+        )
 
     def _draw_selection(self) -> None:
         n = self.state.selection.normalized()
         if n is None:
             return
         x0, y0, x1, y1 = n
-        x0o, y0o, x1o, y1o = x0, y0, x1, y1
-        # 既存の枠を削除して描画
         if self.state.selection_rect_id is not None:
             self.canvas.delete(self.state.selection_rect_id)
         self.state.selection_rect_id = self.canvas.create_rectangle(
-            x0o, y0o, x1o, y1o,
-            outline="#00FF88",
-            dash=(6, 3),
-            width=2
+            x0, y0, x1, y1, outline="#00FF88", dash=(6, 3), width=2
         )
 
     def _update_nav_buttons(self) -> None:
@@ -443,9 +393,8 @@ class PdfCropperApp(ttk.Frame):
 # ----------------------------- エントリポイント -----------------------------
 def main() -> None:
     root = tk.Tk()
-    # ttk の見た目
     try:
-        root.call("tk", "scaling", 1.2)  # HiDPI 環境向け (必要なら)
+        root.call("tk", "scaling", 1.2)
         style = ttk.Style()
         if sys.platform == "darwin":
             style.theme_use("aqua")
